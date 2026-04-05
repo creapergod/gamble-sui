@@ -16,7 +16,7 @@ import {
   useDAppKit,
 } from "@mysten/dapp-kit-react";
 import { buyTicket } from "@/utils/tx/buy_ticket";
-import { redeem } from "@/utils/tx/redeem";
+import { redeem, redeemBatch } from "@/utils/tx/redeem";
 
 // ---- Stat component ----
 interface TicketItem {
@@ -38,6 +38,7 @@ interface PoolItem {
   potSui: number;      // current prize pot
   ticketPrice: number; // price per ticket (SUI)
   canRedeem?: boolean; // whether tickets can be redeemed
+  winnerCopyIds: string[]; // original Ticket IDs that won (from pool.indices × pool.idT)
 }
 
 function generateDemoPools(): PoolItem[] {
@@ -50,6 +51,7 @@ function generateDemoPools(): PoolItem[] {
       expiresAt: now + 1000 * 60 * 45,
       potSui: 32.5,
       ticketPrice: 1,
+      winnerCopyIds: [],
     },
     {
       id: "P-130",
@@ -58,6 +60,7 @@ function generateDemoPools(): PoolItem[] {
       expiresAt: now + 1000 * 60 * 90,
       potSui: 12.0,
       ticketPrice: 1,
+      winnerCopyIds: [],
     },
     {
       id: "P-131",
@@ -66,6 +69,7 @@ function generateDemoPools(): PoolItem[] {
       expiresAt: now + 1000 * 60 * 150,
       potSui: 4.2,
       ticketPrice: 1,
+      winnerCopyIds: [],
     },
   ];
 }
@@ -199,12 +203,13 @@ export default function GambleSUIPage() {
         const stakeSui = pool ? pool.ticketPrice : 0;
         const isActive = pool ? pool.expiresAt - Date.now() > 0 : true;
         
-        // Determine status based on pool state
+        // Determine status based on pool state and whether this ticket won
         let status: TicketItem["status"] = "Active";
         if (pool?.canRedeem) {
-          status = "Won"; // Pool allows redemption, tickets are winners
+          const isWinner = pool.winnerCopyIds.includes(address);
+          status = isWinner ? "Won" : "Lost";
         } else if (!isActive) {
-          status = "Settled"; // Pool expired but no redemption allowed
+          status = "Settled"; // Pool expired but redeem_setting not yet called
         }
 
         const t: TicketItem = {
@@ -264,6 +269,21 @@ export default function GambleSUIPage() {
           const expiresAt = Number(jsonData.end_time) || 0;
           const createdAt = expiresAt > 0 ? Math.max(expiresAt - WINDOW_MS, 0) : 0;
 
+          // Compute winning ticket IDs: pool.indices are positions into pool.idT,
+          // and each TicketCopy.copy_id is the ID of the original Ticket object.
+          const idT: any[] = jsonData.idT ?? jsonData.id_t ?? [];
+          const rawIndices: any[] = jsonData.indices ?? [];
+          const winnerCopyIds: string[] = rawIndices
+            .map((idx: any) => {
+              const i = Number(idx);
+              const entry = idT[i];
+              if (!entry) return null;
+              // copy_id serializes as a plain hex string (type ID)
+              const cid = entry.copy_id ?? entry.copyId;
+              return typeof cid === "string" ? cid : null;
+            })
+            .filter(Boolean) as string[];
+
           return {
             id: addr,
             name: `Round ${addr.slice(2, 6).toUpperCase()}`,
@@ -272,6 +292,7 @@ export default function GambleSUIPage() {
             potSui,
             ticketPrice,
             canRedeem,
+            winnerCopyIds,
           } as PoolItem;
         })
         .filter(Boolean) as PoolItem[];
@@ -335,7 +356,8 @@ export default function GambleSUIPage() {
       coin_result,
       price,
       Number(Number(quote) * 1000000000),
-      acc?.address
+      acc?.address,
+      Number(quantity) || 1,
     )
     const result = await dAppKit.signAndExecuteTransaction({ transaction: tx });
     if (result.FailedTransaction) {
@@ -359,6 +381,31 @@ export default function GambleSUIPage() {
     setFlashPot(true);
     setTimeout(() => setFlashPot(false), 700);
     setTimeout(() => setPotDelta(null), 1200);
+  };
+
+  const handleRedeemAll = async () => {
+    if (!acc?.address) {
+      alert("Please connect your wallet first");
+      return;
+    }
+    const wonTickets = tickets.filter((t) => t.status === "Won" && t.poolId);
+    if (wonTickets.length === 0) {
+      alert("No winning tickets to redeem");
+      return;
+    }
+    try {
+      const tx = redeemBatch(wonTickets.map((t) => ({ ticketId: t.id, poolId: t.poolId! })));
+      const result = await dAppKit.signAndExecuteTransaction({ transaction: tx });
+      if (result.FailedTransaction) {
+        throw new Error(result.FailedTransaction.status.error?.message ?? "Redeem failed");
+      }
+      console.log("Batch redeem successful, digest:", result.Transaction.digest);
+      alert(`Redeemed ${wonTickets.length} ticket(s)! Digest: ` + result.Transaction.digest);
+      fetchTicket();
+    } catch (error) {
+      console.error("Batch redeem error:", error);
+      alert("Failed to redeem: " + (error instanceof Error ? error.message : String(error)));
+    }
   };
 
   const handleRedeem = async (ticket: TicketItem) => {
@@ -491,6 +538,14 @@ export default function GambleSUIPage() {
                   >
                     Refresh Tickets
                   </Button>
+                  {tickets.some((t) => t.status === "Won") && (
+                    <Button
+                      className="bg-emerald-600 hover:bg-emerald-500 text-white"
+                      onClick={handleRedeemAll}
+                    >
+                      Redeem All ({tickets.filter((t) => t.status === "Won").length})
+                    </Button>
+                  )}
                 </div>
               </CardHeader>
               <CardContent>
@@ -525,7 +580,7 @@ export default function GambleSUIPage() {
                           </TableCell>
                           <TableCell className="text-right text-zinc-300">{formatTime(t.placedAt)}</TableCell>
                           <TableCell className="text-center">
-                            {(t.status === "Won" || t.status === "Settled") && (
+                            {t.status === "Won" && (
                               <Button
                                 size="sm"
                                 className="bg-emerald-600 hover:bg-emerald-500 text-white"
